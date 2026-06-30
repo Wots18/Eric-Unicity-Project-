@@ -1,0 +1,17 @@
+{
+  "name": "sphere-autovend",
+  "version": "1.0.0",
+  "description": "An autonomous on-network vending agent for the Unicity v2 testnet, built on the Sphere SDK.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/autovend.js"
+  },
+  "dependencies": {
+    "@unicitylabs/sphere-sdk": "^0.8.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
