@@ -4,8 +4,8 @@
  * Dual settlement, no human in the loop:
  *   1) Payment-request path: on "buy", the agent issues a signed payment request.
  *      If the buyer approves it, the agent gets a "paid" signal and delivers.
- *   2) Direct-pay path: the agent also watches its own balance; if the buyer just
- *      sends the exact amount, the agent detects it and delivers.
+ *   2) Direct-pay path: the agent pulls incoming transfers with receive(), watches
+ *      its balance, and delivers when the exact amount arrives.
  * Whichever fires first delivers the good; double-delivery is prevented.
  */
 
@@ -185,6 +185,8 @@ async function handleOrder(sphere, msg, item) {
 }
 
 async function pollSettlements(sphere) {
+  // Incoming transfers are NOT auto-credited — pull anything sent to us first.
+  try { if (typeof sphere.payments.receive === 'function') await sphere.payments.receive(); } catch (e) { log('receive (non-fatal):', e.message); }
   try { if (typeof sphere.payments.sync === 'function') await sphere.payments.sync(); } catch {}
   const bal = await getUctBaseBalance(sphere);
   if (bal === null) return;
@@ -258,6 +260,14 @@ async function main() {
   await advertiseToMarket(sphere);
 
   sphere.communications.onDirectMessage((msg) => { handleMessage(sphere, msg).catch((e) => log('message error:', e.message)); });
+
+  // Settle instantly the moment a payment arrives (in addition to the poller).
+  if (typeof sphere.on === 'function') {
+    sphere.on('transfer:incoming', (t) => {
+      log(`Incoming transfer detected${t && (t.senderNametag || t.senderPubkey) ? ' from ' + (t.senderNametag || t.senderPubkey) : ''}.`);
+      pollSettlements(sphere).catch((e) => log('settle-on-incoming error:', e.message));
+    });
+  }
 
   STATUS.live = true;
   startStatusServer();
