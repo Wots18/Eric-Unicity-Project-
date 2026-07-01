@@ -1,12 +1,14 @@
 /**
  * Sphere AutoVend — autonomous on-network vending agent (Unicity v2 testnet).
  *
- * Dual settlement, no human in the loop:
- *   1) Payment-request path: on "buy", the agent issues a signed payment request.
- *      If the buyer approves it, the agent gets a "paid" signal and delivers.
- *   2) Direct-pay path: the agent pulls incoming transfers with receive(), watches
- *      its balance, and delivers when the exact amount arrives.
- * Whichever fires first delivers the good; double-delivery is prevented.
+ * Settlement, no human in the loop:
+ *   - On "buy <id>", the agent records a pending order (and sends a payment request).
+ *   - When a payment ARRIVES, the agent settles straight from the transfer itself:
+ *       * the `transfer:incoming` event fires, and/or
+ *       * `payments.receive()` pulls the transfer in,
+ *     then it matches the SENDER to their pending order and delivers the good.
+ *   - No balance math: the arrival of the transfer IS the proof of payment.
+ * Double-delivery is prevented via a per-order `delivered` flag.
  */
 
 import 'dotenv/config';
@@ -47,13 +49,6 @@ function uctToBase(human) {
   const frac = (f + '0'.repeat(CONFIG.decimals)).slice(0, CONFIG.decimals);
   return BigInt(i || '0') * (10n ** BigInt(CONFIG.decimals)) + BigInt(frac || '0');
 }
-function baseToUct(base) {
-  const b = BigInt(base);
-  const d = 10n ** BigInt(CONFIG.decimals);
-  const whole = b / d;
-  const frac = (b % d).toString().padStart(CONFIG.decimals, '0').replace(/0+$/, '');
-  return frac ? `${whole}.${frac}` : `${whole}`;
-}
 
 function buildMenu() {
   const lines = INVENTORY.map((i) => `  - ${i.id}: ${i.name} — ${i.price} ${CONFIG.coinSymbol}` + (i.stock <= 0 ? ' (SOLD OUT)' : ''));
@@ -64,6 +59,7 @@ function replyTarget(msg) {
   if (msg.senderNametag) return `@${String(msg.senderNametag).replace(/^@/, '')}`;
   return msg.senderPubkey;
 }
+function normId(x) { return x ? String(x).replace(/^@/, '').toLowerCase() : x; }
 
 async function recordSale(sale) {
   try {
@@ -75,24 +71,12 @@ async function recordSale(sale) {
   } catch (e) { log('Could not persist sale (non-fatal):', e.message); }
 }
 
-async function getUctBaseBalance(sphere) {
-  try {
-    const assets = await Promise.resolve(
-      sphere.payments.getBalance ? sphere.payments.getBalance() : sphere.payments.getAssets()
-    );
-    const a = (assets || []).find((x) => (x.symbol || '').toUpperCase() === CONFIG.coinSymbol);
-    if (!a) return 0n;
-    const v = a.totalAmount;
-    if (typeof v === 'bigint') return v;
-    if (typeof v === 'number') return BigInt(Math.trunc(v));
-    const s = String(v);
-    return s.includes('.') ? uctToBase(s) : BigInt(s);
-  } catch (e) { log('Balance read failed:', e.message); return null; }
-}
-
 async function ensureTreasury(sphere) {
-  const bal = await getUctBaseBalance(sphere);
-  if (bal && bal > 0n) { log(`Treasury OK: ${baseToUct(bal)} ${CONFIG.coinSymbol}`); return; }
+  try {
+    const assets = await Promise.resolve(sphere.payments.getBalance ? sphere.payments.getBalance() : sphere.payments.getAssets());
+    const a = (assets || []).find((x) => (x.symbol || '').toUpperCase() === CONFIG.coinSymbol);
+    if (a && a.totalAmount && BigInt(a.totalAmount) > 0n) { log(`Treasury OK for ${CONFIG.coinSymbol}.`); return; }
+  } catch (e) { log('Balance check failed (will try to mint):', e.message); }
   log(`Treasury empty — self-minting ${CONFIG.mintAmount} ${CONFIG.coinSymbol}...`);
   try {
     const coinId = getCoinIdBySymbol(CONFIG.coinSymbol);
@@ -125,7 +109,7 @@ function startStatusServer() {
       service: 'Sphere AutoVend', nametag: `@${STATUS.nametag}`, address: STATUS.address,
       live: STATUS.live, salesCompleted: STATUS.salesCount, startedAt: STATUS.startedAt,
       menu: INVENTORY.map(({ id, name, price }) => ({ id, name, price: `${price} ${CONFIG.coinSymbol}` })),
-      howToBuy: `DM @${STATUS.nametag} "menu", then "buy <id>", then approve the request or send that amount of ${CONFIG.coinSymbol}.`,
+      howToBuy: `DM @${STATUS.nametag} "menu", then "buy <id>", then send that amount of ${CONFIG.coinSymbol}.`,
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body, null, 2));
@@ -134,10 +118,8 @@ function startStatusServer() {
   server.listen(port, () => log(`Status page live on port ${port}.`));
 }
 
-// Orders awaiting payment; settled by request-response OR by detecting funds.
+// Orders awaiting payment.
 const pendingOrders = [];
-let creditedBaseline = 0n;
-let baselineReady = false;
 
 async function safeDM(sphere, target, text) {
   try { await sphere.communications.sendDM(target, text); } catch (e) { log(`Failed to DM ${target}:`, e.message); }
@@ -148,7 +130,6 @@ async function deliverOrder(sphere, order, via) {
   order.delivered = true;
   const idx = pendingOrders.indexOf(order);
   if (idx >= 0) pendingOrders.splice(idx, 1);
-  creditedBaseline += order.priceBase; // account for this payment so the poller doesn't double-count
   const good = order.item.deliver();
   order.item.stock -= 1;
   STATUS.salesCount += 1;
@@ -157,67 +138,79 @@ async function deliverOrder(sphere, order, via) {
   log(`SOLD ${order.item.id} to ${order.buyer} (${via}). Stock left: ${order.item.stock}`);
 }
 
+// Settle by matching a payment's SENDER to a pending order.
+async function settleFromSender(sphere, sender, via) {
+  const s = normId(sender);
+  let order = pendingOrders.find((o) => !o.delivered && normId(o.buyer) === s);
+  if (!order) {
+    const open = pendingOrders.filter((o) => !o.delivered);
+    if (open.length === 1) { order = open[0]; log(`No exact sender match; delivering the single open order (${via}).`); }
+  }
+  if (order) await deliverOrder(sphere, order, via);
+  else log(`Payment arrived (${via}) from ${sender || 'unknown'} but no matching pending order.`);
+}
+
+function transferSender(t) {
+  if (!t) return null;
+  if (t.senderNametag) return `@${String(t.senderNametag).replace(/^@/, '')}`;
+  return t.senderPubkey || t.sender || t.fromNametag || t.from || null;
+}
+
+// Pull any pending incoming transfers and settle each one.
+async function processReceived(sphere, via) {
+  let res;
+  try { res = typeof sphere.payments.receive === 'function' ? await sphere.payments.receive() : null; }
+  catch (e) { log('receive() error:', e.message); return; }
+  if (!res) return;
+  let transfers = [];
+  if (Array.isArray(res)) transfers = res;
+  else if (Array.isArray(res.transfers)) transfers = res.transfers;
+  else if (Array.isArray(res.received)) transfers = res.received;
+  if (transfers.length === 0) {
+    if (res && (res.count || res.received || res.transfers)) log('receive() returned (shape):', JSON.stringify(res).slice(0, 300));
+    return;
+  }
+  for (const t of transfers) {
+    log(`Pulled transfer from ${transferSender(t) || 'unknown'} (${(t.tokens && t.tokens.length) || '?'} token(s)).`);
+    await settleFromSender(sphere, transferSender(t), via);
+  }
+}
+
 async function handleOrder(sphere, msg, item) {
   const target = replyTarget(msg);
   if (item.stock <= 0) { await safeDM(sphere, target, `Sorry, "${item.id}" is sold out.`); return; }
   if (pendingOrders.find((o) => o.buyer === target && o.item.id === item.id && !o.delivered)) {
-    await safeDM(sphere, target, `You already have a pending order for ${item.name}. Approve the request or send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag}.`);
+    await safeDM(sphere, target, `You already have a pending order for ${item.name}. Send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag} to complete it.`);
     return;
   }
-  const priceBase = uctToBase(item.price);
-  const order = { buyer: target, item, priceBase, createdAt: Date.now(), delivered: false };
+  const order = { buyer: target, item, createdAt: Date.now(), delivered: false };
   pendingOrders.push(order);
   log(`Order from ${target}: ${item.id} (${item.price} ${CONFIG.coinSymbol}) — awaiting payment.`);
 
-  // Path 1: payment request + response signal (non-blocking).
-  let req = null;
+  // Also send a payment request; if the buyer approves it, that arrives as a transfer too.
   try {
-    req = await sphere.payments.sendPaymentRequest(target, { amount: priceBase.toString(), coinId: CONFIG.coinSymbol, message: `AutoVend: ${item.name}` });
+    await sphere.payments.sendPaymentRequest(target, { amount: uctToBase(item.price).toString(), coinId: CONFIG.coinSymbol, message: `AutoVend: ${item.name}` });
   } catch (e) { log('payment request send (non-fatal):', e.message); }
-  if (req && req.success && req.requestId) {
-    sphere.payments.waitForPaymentResponse(req.requestId, CONFIG.orderTtlMs)
-      .then((resp) => { if (resp && resp.responseType === 'paid') return deliverOrder(sphere, order, 'payment request'); })
-      .catch((e) => log('payment response wait ended:', e.message));
-  }
 
   const mins = Math.round(CONFIG.orderTtlMs / 60000);
-  await safeDM(sphere, target, `Order received: ${item.name}.\nEither approve the payment request in your wallet, OR send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag}.\nI'll deliver automatically within a minute. (Order expires in ${mins} min.)`);
+  await safeDM(sphere, target, `Order received: ${item.name}.\nSend exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag} (or approve the payment request if your wallet shows one).\nI'll deliver automatically the moment it arrives. (Order expires in ${mins} min.)`);
 }
 
-async function pollSettlements(sphere) {
-  // Incoming transfers are NOT auto-credited — pull anything sent to us first.
-  try { if (typeof sphere.payments.receive === 'function') await sphere.payments.receive(); } catch (e) { log('receive (non-fatal):', e.message); }
-  try { if (typeof sphere.payments.sync === 'function') await sphere.payments.sync(); } catch {}
-  const bal = await getUctBaseBalance(sphere);
-  if (bal === null) return;
-  if (!baselineReady) { creditedBaseline = bal; baselineReady = true; log(`Settlement baseline set: ${baseToUct(bal)} ${CONFIG.coinSymbol}.`); return; }
-
+function expireOldOrders(sphere) {
   const now = Date.now();
   for (let i = pendingOrders.length - 1; i >= 0; i--) {
     const o = pendingOrders[i];
     if (!o.delivered && now - o.createdAt > CONFIG.orderTtlMs) {
       pendingOrders.splice(i, 1);
-      await safeDM(sphere, o.buyer, `Your order for ${o.item.name} expired (no payment received). DM "buy ${o.item.id}" to try again.`);
+      safeDM(sphere, o.buyer, `Your order for ${o.item.name} expired (no payment received). DM "buy ${o.item.id}" to try again.`);
       log(`Order expired for ${o.buyer}: ${o.item.id}`);
-    }
-  }
-
-  let available = bal - creditedBaseline;
-  if (available <= 0n) return;
-  log(`Detected ${baseToUct(available)} ${CONFIG.coinSymbol} unsettled; pending orders: ${pendingOrders.length}.`);
-
-  for (const o of [...pendingOrders]) {
-    if (!o.delivered && o.priceBase <= available) {
-      available -= o.priceBase;
-      await deliverOrder(sphere, o, 'direct payment');
     }
   }
 }
 
 async function handleMessage(sphere, msg) {
-  // Ignore our own messages — this network echoes sent DMs back to us, which would
-  // otherwise cause an infinite self-reply loop.
-  const senderTag = (msg.senderNametag || '').replace(/^@/, '').toLowerCase();
+  // Ignore our own messages — the network echoes sent DMs back, which would loop.
+  const senderTag = normId(msg.senderNametag || '');
   if ((senderTag && senderTag === STATUS.nametag) || (STATUS.pubkey && msg.senderPubkey === STATUS.pubkey)) return;
 
   const text = (msg.content || '').trim();
@@ -267,11 +260,15 @@ async function main() {
 
   sphere.communications.onDirectMessage((msg) => { handleMessage(sphere, msg).catch((e) => log('message error:', e.message)); });
 
-  // Settle instantly the moment a payment arrives (in addition to the poller).
+  // Settle the instant a payment arrives.
   if (typeof sphere.on === 'function') {
     sphere.on('transfer:incoming', (t) => {
-      log(`Incoming transfer detected${t && (t.senderNametag || t.senderPubkey) ? ' from ' + (t.senderNametag || t.senderPubkey) : ''}.`);
-      pollSettlements(sphere).catch((e) => log('settle-on-incoming error:', e.message));
+      log(`transfer:incoming from ${transferSender(t) || 'unknown'} (${(t && t.tokens && t.tokens.length) || '?'} token(s)).`);
+      (async () => { try { await sphere.payments.receive(); } catch {} await settleFromSender(sphere, transferSender(t), 'incoming event'); })()
+        .catch((e) => log('settle-on-incoming error:', e.message));
+    });
+    sphere.on('transfer:confirmed', (t) => {
+      settleFromSender(sphere, transferSender(t), 'confirmed event').catch((e) => log('settle-on-confirm error:', e.message));
     });
   }
 
@@ -281,9 +278,10 @@ async function main() {
   log('--------------------------------------------------------------');
   log(buildMenu());
   log('--------------------------------------------------------------');
-  log(`AutoVend is LIVE. Buyers: DM @${STATUS.nametag} "menu", then "buy <id>", then approve or send.`);
+  log(`AutoVend is LIVE. Buyers: DM @${STATUS.nametag} "menu", then "buy <id>", then send the amount.`);
 
-  setInterval(() => pollSettlements(sphere).catch((e) => log('poll error:', e.message)), CONFIG.pollMs);
+  // Safety-net poller: pull any pending transfers and expire stale orders.
+  setInterval(() => { processReceived(sphere, 'poll receive').catch((e) => log('poll error:', e.message)); expireOldOrders(sphere); }, CONFIG.pollMs);
   setInterval(() => advertiseToMarket(sphere).catch(() => {}), 30 * 60 * 1000);
   setInterval(() => log(`heartbeat — live, pending orders: ${pendingOrders.length}`), 5 * 60 * 1000);
 
