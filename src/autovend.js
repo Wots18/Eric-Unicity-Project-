@@ -1,10 +1,12 @@
 /**
  * Sphere AutoVend — autonomous on-network vending agent (Unicity v2 testnet).
  *
- * Settlement model: PAY-FIRST. A buyer sends the exact price to the agent's nametag;
- * the agent detects the incoming payment (by watching its own balance) and delivers
- * the digital good over DM automatically, with no human in the loop. It also fires a
- * payment request (best-effort) for wallets that support approving one.
+ * Dual settlement, no human in the loop:
+ *   1) Payment-request path: on "buy", the agent issues a signed payment request.
+ *      If the buyer approves it, the agent gets a "paid" signal and delivers.
+ *   2) Direct-pay path: the agent also watches its own balance; if the buyer just
+ *      sends the exact amount, the agent detects it and delivers.
+ * Whichever fires first delivers the good; double-delivery is prevented.
  */
 
 import 'dotenv/config';
@@ -123,7 +125,7 @@ function startStatusServer() {
       service: 'Sphere AutoVend', nametag: `@${STATUS.nametag}`, address: STATUS.address,
       live: STATUS.live, salesCompleted: STATUS.salesCount, startedAt: STATUS.startedAt,
       menu: INVENTORY.map(({ id, name, price }) => ({ id, name, price: `${price} ${CONFIG.coinSymbol}` })),
-      howToBuy: `DM @${STATUS.nametag} "menu", then "buy <id>", then send that amount of ${CONFIG.coinSymbol}.`,
+      howToBuy: `DM @${STATUS.nametag} "menu", then "buy <id>", then approve the request or send that amount of ${CONFIG.coinSymbol}.`,
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body, null, 2));
@@ -132,7 +134,7 @@ function startStatusServer() {
   server.listen(port, () => log(`Status page live on port ${port}.`));
 }
 
-// Orders awaiting payment, settled by detecting incoming funds.
+// Orders awaiting payment; settled by request-response OR by detecting funds.
 const pendingOrders = [];
 let creditedBaseline = 0n;
 let baselineReady = false;
@@ -141,21 +143,45 @@ async function safeDM(sphere, target, text) {
   try { await sphere.communications.sendDM(target, text); } catch (e) { log(`Failed to DM ${target}:`, e.message); }
 }
 
+async function deliverOrder(sphere, order, via) {
+  if (order.delivered) return;
+  order.delivered = true;
+  const idx = pendingOrders.indexOf(order);
+  if (idx >= 0) pendingOrders.splice(idx, 1);
+  creditedBaseline += order.priceBase; // account for this payment so the poller doesn't double-count
+  const good = order.item.deliver();
+  order.item.stock -= 1;
+  STATUS.salesCount += 1;
+  await safeDM(sphere, order.buyer, `Payment received. Here is your ${order.item.name}:\n${good}\n\nThanks for shopping at AutoVend!`);
+  await recordSale({ at: new Date().toISOString(), buyer: order.buyer, item: order.item.id, price: order.item.price, coin: CONFIG.coinSymbol, via, delivered: good });
+  log(`SOLD ${order.item.id} to ${order.buyer} (${via}). Stock left: ${order.item.stock}`);
+}
+
 async function handleOrder(sphere, msg, item) {
   const target = replyTarget(msg);
   if (item.stock <= 0) { await safeDM(sphere, target, `Sorry, "${item.id}" is sold out.`); return; }
-  if (pendingOrders.find((o) => o.buyer === target && o.item.id === item.id)) {
-    await safeDM(sphere, target, `You already have a pending order for ${item.name}. Send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag} to complete it.`);
+  if (pendingOrders.find((o) => o.buyer === target && o.item.id === item.id && !o.delivered)) {
+    await safeDM(sphere, target, `You already have a pending order for ${item.name}. Approve the request or send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag}.`);
     return;
   }
   const priceBase = uctToBase(item.price);
-  pendingOrders.push({ buyer: target, item, priceBase, createdAt: Date.now() });
+  const order = { buyer: target, item, priceBase, createdAt: Date.now(), delivered: false };
+  pendingOrders.push(order);
   log(`Order from ${target}: ${item.id} (${item.price} ${CONFIG.coinSymbol}) — awaiting payment.`);
+
+  // Path 1: payment request + response signal (non-blocking).
+  let req = null;
   try {
-    await sphere.payments.sendPaymentRequest(target, { amount: priceBase.toString(), coinId: CONFIG.coinSymbol, message: `AutoVend: ${item.name}` });
-  } catch (e) { log('payment request (non-fatal):', e.message); }
+    req = await sphere.payments.sendPaymentRequest(target, { amount: priceBase.toString(), coinId: CONFIG.coinSymbol, message: `AutoVend: ${item.name}` });
+  } catch (e) { log('payment request send (non-fatal):', e.message); }
+  if (req && req.success && req.requestId) {
+    sphere.payments.waitForPaymentResponse(req.requestId, CONFIG.orderTtlMs)
+      .then((resp) => { if (resp && resp.responseType === 'paid') return deliverOrder(sphere, order, 'payment request'); })
+      .catch((e) => log('payment response wait ended:', e.message));
+  }
+
   const mins = Math.round(CONFIG.orderTtlMs / 60000);
-  await safeDM(sphere, target, `Order received: ${item.name}.\nTo pay, send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag} from your wallet.\nI'll deliver automatically within a minute of payment. (Order expires in ${mins} min.)`);
+  await safeDM(sphere, target, `Order received: ${item.name}.\nEither approve the payment request in your wallet, OR send exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag}.\nI'll deliver automatically within a minute. (Order expires in ${mins} min.)`);
 }
 
 async function pollSettlements(sphere) {
@@ -166,8 +192,9 @@ async function pollSettlements(sphere) {
 
   const now = Date.now();
   for (let i = pendingOrders.length - 1; i >= 0; i--) {
-    if (now - pendingOrders[i].createdAt > CONFIG.orderTtlMs) {
-      const o = pendingOrders.splice(i, 1)[0];
+    const o = pendingOrders[i];
+    if (!o.delivered && now - o.createdAt > CONFIG.orderTtlMs) {
+      pendingOrders.splice(i, 1);
       await safeDM(sphere, o.buyer, `Your order for ${o.item.name} expired (no payment received). DM "buy ${o.item.id}" to try again.`);
       log(`Order expired for ${o.buyer}: ${o.item.id}`);
     }
@@ -177,19 +204,11 @@ async function pollSettlements(sphere) {
   if (available <= 0n) return;
   log(`Detected ${baseToUct(available)} ${CONFIG.coinSymbol} unsettled; pending orders: ${pendingOrders.length}.`);
 
-  for (let i = 0; i < pendingOrders.length;) {
-    const o = pendingOrders[i];
-    if (o.priceBase <= available) {
+  for (const o of [...pendingOrders]) {
+    if (!o.delivered && o.priceBase <= available) {
       available -= o.priceBase;
-      creditedBaseline += o.priceBase;
-      pendingOrders.splice(i, 1);
-      const good = o.item.deliver();
-      o.item.stock -= 1;
-      STATUS.salesCount += 1;
-      await safeDM(sphere, o.buyer, `Payment received. Here is your ${o.item.name}:\n${good}\n\nThanks for shopping at AutoVend!`);
-      await recordSale({ at: new Date().toISOString(), buyer: o.buyer, item: o.item.id, price: o.item.price, coin: CONFIG.coinSymbol, delivered: good });
-      log(`SOLD ${o.item.id} to ${o.buyer} (payment detected). Stock left: ${o.item.stock}`);
-    } else { i++; }
+      await deliverOrder(sphere, o, 'direct payment');
+    }
   }
 }
 
@@ -246,7 +265,7 @@ async function main() {
   log('--------------------------------------------------------------');
   log(buildMenu());
   log('--------------------------------------------------------------');
-  log(`AutoVend is LIVE. Buyers: DM @${STATUS.nametag} "menu", then "buy <id>", then send the amount.`);
+  log(`AutoVend is LIVE. Buyers: DM @${STATUS.nametag} "menu", then "buy <id>", then approve or send.`);
 
   setInterval(() => pollSettlements(sphere).catch((e) => log('poll error:', e.message)), CONFIG.pollMs);
   setInterval(() => advertiseToMarket(sphere).catch(() => {}), 30 * 60 * 1000);
