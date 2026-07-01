@@ -308,6 +308,7 @@ async function main() {
 
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
+    network: CONFIG.network,
     autoGenerate: true,
     nametag: CONFIG.nametag,
   });
