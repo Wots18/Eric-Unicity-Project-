@@ -2,8 +2,8 @@
  * Sphere AutoVend — autonomous on-network vending agent (Unicity v2 testnet).
  * Settlement: on "buy", record a pending order + send a payment request. When a
  * payment ARRIVES (transfer:incoming event or receive()), match the SENDER to their
- * pending order and deliver. The agent also publishes its identity on-chain at boot
- * so it can receive.
+ * pending order and deliver. The agent publishes its transport binding at boot so it
+ * can receive.
  */
 
 import 'dotenv/config';
@@ -212,46 +212,20 @@ async function handleMessage(sphere, msg) {
   await safeDM(sphere, target, `I didn't understand that.\n\n${buildMenu()}`);
 }
 
-function listMethods(obj, label) {
-  if (!obj) { log(`METHODS ${label}: (none)`); return; }
-  const names = new Set();
-  let o = obj;
-  for (let d = 0; d < 3 && o; d++, o = Object.getPrototypeOf(o)) {
-    for (const k of Object.getOwnPropertyNames(o)) {
-      try { if (typeof obj[k] === 'function' && k !== 'constructor') names.add(k); } catch {}
-    }
-  }
-  log(`METHODS ${label}:`, [...names].sort().join(', ') || '(none)');
-}
-
+// Publish the identity's transport binding so senders can resolve us and pay us.
 async function publishIdentity(sphere) {
-  listMethods(sphere, 'sphere');
-  listMethods(sphere.identity, 'sphere.identity');
-  listMethods(sphere.payments, 'sphere.payments');
-  listMethods(sphere.nametag, 'sphere.nametag');
-
-  const candidates = [
-    ['sphere.publishIdentity', () => sphere.publishIdentity && sphere.publishIdentity()],
-    ['sphere.mintNametag', () => sphere.mintNametag && sphere.mintNametag()],
-    ['sphere.identity.publish', () => sphere.identity && sphere.identity.publish && sphere.identity.publish()],
-    ['sphere.identity.mint', () => sphere.identity && sphere.identity.mint && sphere.identity.mint()],
-    ['sphere.identity.mintNametag', () => sphere.identity && sphere.identity.mintNametag && sphere.identity.mintNametag()],
-    ['sphere.nametag.mint', () => sphere.nametag && sphere.nametag.mint && sphere.nametag.mint()],
-    ['sphere.payments.mintNametag', () => sphere.payments && sphere.payments.mintNametag && sphere.payments.mintNametag()],
-    ['sphere.registerNametag(mint)', () => sphere.registerNametag && sphere.registerNametag(CONFIG.nametag, { mint: true })],
-    ['sphere.registerNametag(onchain)', () => sphere.registerNametag && sphere.registerNametag(CONFIG.nametag, { onchain: true, publish: true })],
-  ];
-  for (const [name, fn] of candidates) {
+  const steps = ['ensureUnicityIdInTransport', 'syncIdentityWithTransport'];
+  for (const m of steps) {
     try {
-      const r = fn();
-      if (r === undefined) continue;
-      const res = (r && typeof r.then === 'function') ? await r : r;
-      log(`PUBLISH ok via ${name}:`, res ? JSON.stringify(res).slice(0, 160) : '(done)');
-      return true;
-    } catch (e) { log(`PUBLISH attempt ${name} failed:`, e.message); }
+      if (typeof sphere[m] === 'function') {
+        const r = sphere[m]();
+        const res = (r && typeof r.then === 'function') ? await r : r;
+        log(`PUBLISH ${m}: ok`, res ? JSON.stringify(res).slice(0, 160) : '');
+      } else {
+        log(`PUBLISH ${m}: not present on this SDK build`);
+      }
+    } catch (e) { log(`PUBLISH ${m} failed (non-fatal):`, e.message); }
   }
-  log('PUBLISH: no matching method found — see the METHODS lists above to identify the correct call.');
-  return false;
 }
 
 async function main() {
@@ -281,7 +255,7 @@ async function main() {
   STATUS.address = sphere.identity?.directAddress || null;
   STATUS.pubkey = sphere.identity?.publicKey || sphere.identity?.pubkey || null;
 
-  // Publish identity on-chain so the agent can RECEIVE payments (prints available methods too).
+  // Publish transport binding so the agent can RECEIVE payments.
   await publishIdentity(sphere);
 
   await ensureTreasury(sphere);
