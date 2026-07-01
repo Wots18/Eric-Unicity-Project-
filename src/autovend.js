@@ -1,14 +1,9 @@
 /**
  * Sphere AutoVend — autonomous on-network vending agent (Unicity v2 testnet).
- *
- * Settlement, no human in the loop:
- *   - On "buy <id>", the agent records a pending order (and sends a payment request).
- *   - When a payment ARRIVES, the agent settles straight from the transfer itself:
- *       * the `transfer:incoming` event fires, and/or
- *       * `payments.receive()` pulls the transfer in,
- *     then it matches the SENDER to their pending order and delivers the good.
- *   - No balance math: the arrival of the transfer IS the proof of payment.
- * Double-delivery is prevented via a per-order `delivered` flag.
+ * Settlement: on "buy", record a pending order + send a payment request. When a
+ * payment ARRIVES (transfer:incoming event or receive()), match the SENDER to their
+ * pending order and deliver. The agent also publishes its identity on-chain at boot
+ * so it can receive.
  */
 
 import 'dotenv/config';
@@ -118,7 +113,6 @@ function startStatusServer() {
   server.listen(port, () => log(`Status page live on port ${port}.`));
 }
 
-// Orders awaiting payment.
 const pendingOrders = [];
 
 async function safeDM(sphere, target, text) {
@@ -138,7 +132,6 @@ async function deliverOrder(sphere, order, via) {
   log(`SOLD ${order.item.id} to ${order.buyer} (${via}). Stock left: ${order.item.stock}`);
 }
 
-// Settle by matching a payment's SENDER to a pending order.
 async function settleFromSender(sphere, sender, via) {
   const s = normId(sender);
   let order = pendingOrders.find((o) => !o.delivered && normId(o.buyer) === s);
@@ -156,7 +149,6 @@ function transferSender(t) {
   return t.senderPubkey || t.sender || t.fromNametag || t.from || null;
 }
 
-// Pull any pending incoming transfers and settle each one.
 async function processReceived(sphere, via) {
   let res;
   try { res = typeof sphere.payments.receive === 'function' ? await sphere.payments.receive() : null; }
@@ -166,10 +158,7 @@ async function processReceived(sphere, via) {
   if (Array.isArray(res)) transfers = res;
   else if (Array.isArray(res.transfers)) transfers = res.transfers;
   else if (Array.isArray(res.received)) transfers = res.received;
-  if (transfers.length === 0) {
-    if (res && (res.count || res.received || res.transfers)) log('receive() returned (shape):', JSON.stringify(res).slice(0, 300));
-    return;
-  }
+  if (transfers.length === 0) return;
   for (const t of transfers) {
     log(`Pulled transfer from ${transferSender(t) || 'unknown'} (${(t.tokens && t.tokens.length) || '?'} token(s)).`);
     await settleFromSender(sphere, transferSender(t), via);
@@ -186,12 +175,9 @@ async function handleOrder(sphere, msg, item) {
   const order = { buyer: target, item, createdAt: Date.now(), delivered: false };
   pendingOrders.push(order);
   log(`Order from ${target}: ${item.id} (${item.price} ${CONFIG.coinSymbol}) — awaiting payment.`);
-
-  // Also send a payment request; if the buyer approves it, that arrives as a transfer too.
   try {
     await sphere.payments.sendPaymentRequest(target, { amount: uctToBase(item.price).toString(), coinId: CONFIG.coinSymbol, message: `AutoVend: ${item.name}` });
   } catch (e) { log('payment request send (non-fatal):', e.message); }
-
   const mins = Math.round(CONFIG.orderTtlMs / 60000);
   await safeDM(sphere, target, `Order received: ${item.name}.\nSend exactly ${item.price} ${CONFIG.coinSymbol} to @${STATUS.nametag} (or approve the payment request if your wallet shows one).\nI'll deliver automatically the moment it arrives. (Order expires in ${mins} min.)`);
 }
@@ -209,10 +195,8 @@ function expireOldOrders(sphere) {
 }
 
 async function handleMessage(sphere, msg) {
-  // Ignore our own messages — the network echoes sent DMs back, which would loop.
   const senderTag = normId(msg.senderNametag || '');
   if ((senderTag && senderTag === STATUS.nametag) || (STATUS.pubkey && msg.senderPubkey === STATUS.pubkey)) return;
-
   const text = (msg.content || '').trim();
   const target = replyTarget(msg);
   log(`DM from ${target}: ${text}`);
@@ -226,6 +210,48 @@ async function handleMessage(sphere, msg) {
     return;
   }
   await safeDM(sphere, target, `I didn't understand that.\n\n${buildMenu()}`);
+}
+
+function listMethods(obj, label) {
+  if (!obj) { log(`METHODS ${label}: (none)`); return; }
+  const names = new Set();
+  let o = obj;
+  for (let d = 0; d < 3 && o; d++, o = Object.getPrototypeOf(o)) {
+    for (const k of Object.getOwnPropertyNames(o)) {
+      try { if (typeof obj[k] === 'function' && k !== 'constructor') names.add(k); } catch {}
+    }
+  }
+  log(`METHODS ${label}:`, [...names].sort().join(', ') || '(none)');
+}
+
+async function publishIdentity(sphere) {
+  listMethods(sphere, 'sphere');
+  listMethods(sphere.identity, 'sphere.identity');
+  listMethods(sphere.payments, 'sphere.payments');
+  listMethods(sphere.nametag, 'sphere.nametag');
+
+  const candidates = [
+    ['sphere.publishIdentity', () => sphere.publishIdentity && sphere.publishIdentity()],
+    ['sphere.mintNametag', () => sphere.mintNametag && sphere.mintNametag()],
+    ['sphere.identity.publish', () => sphere.identity && sphere.identity.publish && sphere.identity.publish()],
+    ['sphere.identity.mint', () => sphere.identity && sphere.identity.mint && sphere.identity.mint()],
+    ['sphere.identity.mintNametag', () => sphere.identity && sphere.identity.mintNametag && sphere.identity.mintNametag()],
+    ['sphere.nametag.mint', () => sphere.nametag && sphere.nametag.mint && sphere.nametag.mint()],
+    ['sphere.payments.mintNametag', () => sphere.payments && sphere.payments.mintNametag && sphere.payments.mintNametag()],
+    ['sphere.registerNametag(mint)', () => sphere.registerNametag && sphere.registerNametag(CONFIG.nametag, { mint: true })],
+    ['sphere.registerNametag(onchain)', () => sphere.registerNametag && sphere.registerNametag(CONFIG.nametag, { onchain: true, publish: true })],
+  ];
+  for (const [name, fn] of candidates) {
+    try {
+      const r = fn();
+      if (r === undefined) continue;
+      const res = (r && typeof r.then === 'function') ? await r : r;
+      log(`PUBLISH ok via ${name}:`, res ? JSON.stringify(res).slice(0, 160) : '(done)');
+      return true;
+    } catch (e) { log(`PUBLISH attempt ${name} failed:`, e.message); }
+  }
+  log('PUBLISH: no matching method found — see the METHODS lists above to identify the correct call.');
+  return false;
 }
 
 async function main() {
@@ -255,12 +281,14 @@ async function main() {
   STATUS.address = sphere.identity?.directAddress || null;
   STATUS.pubkey = sphere.identity?.publicKey || sphere.identity?.pubkey || null;
 
+  // Publish identity on-chain so the agent can RECEIVE payments (prints available methods too).
+  await publishIdentity(sphere);
+
   await ensureTreasury(sphere);
   await advertiseToMarket(sphere);
 
   sphere.communications.onDirectMessage((msg) => { handleMessage(sphere, msg).catch((e) => log('message error:', e.message)); });
 
-  // Settle the instant a payment arrives.
   if (typeof sphere.on === 'function') {
     sphere.on('transfer:incoming', (t) => {
       log(`transfer:incoming from ${transferSender(t) || 'unknown'} (${(t && t.tokens && t.tokens.length) || '?'} token(s)).`);
@@ -280,7 +308,6 @@ async function main() {
   log('--------------------------------------------------------------');
   log(`AutoVend is LIVE. Buyers: DM @${STATUS.nametag} "menu", then "buy <id>", then send the amount.`);
 
-  // Safety-net poller: pull any pending transfers and expire stale orders.
   setInterval(() => { processReceived(sphere, 'poll receive').catch((e) => log('poll error:', e.message)); expireOldOrders(sphere); }, CONFIG.pollMs);
   setInterval(() => advertiseToMarket(sphere).catch(() => {}), 30 * 60 * 1000);
   setInterval(() => log(`heartbeat — live, pending orders: ${pendingOrders.length}`), 5 * 60 * 1000);
