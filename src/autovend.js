@@ -208,7 +208,7 @@ async function handleOrder(sphere, msg, item) {
   try {
     log(`Order from ${target}: ${item.id} (${item.price} ${CONFIG.coinSymbol})`);
 
-    const amount = parseTokenAmount(item.price).toString();
+    const amount = BigInt(Math.round(parseFloat(item.price) * 1000000)).toString();
     const req = await sphere.payments.sendPaymentRequest(target, {
       amount,
       coinId: CONFIG.coinSymbol,
