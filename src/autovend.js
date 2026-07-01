@@ -117,7 +117,7 @@ async function advertiseToMarket(sphere) {
   } catch (e) { log('Market advertise failed (non-fatal):', e.message); }
 }
 
-const STATUS = { nametag: CONFIG.nametag, address: null, live: false, salesCount: 0, startedAt: new Date().toISOString() };
+const STATUS = { nametag: CONFIG.nametag, address: null, pubkey: null, live: false, salesCount: 0, startedAt: new Date().toISOString() };
 function startStatusServer() {
   const port = Number(process.env.PORT || 3000);
   const server = http.createServer((req, res) => {
@@ -215,6 +215,11 @@ async function pollSettlements(sphere) {
 }
 
 async function handleMessage(sphere, msg) {
+  // Ignore our own messages — this network echoes sent DMs back to us, which would
+  // otherwise cause an infinite self-reply loop.
+  const senderTag = (msg.senderNametag || '').replace(/^@/, '').toLowerCase();
+  if ((senderTag && senderTag === STATUS.nametag) || (STATUS.pubkey && msg.senderPubkey === STATUS.pubkey)) return;
+
   const text = (msg.content || '').trim();
   const target = replyTarget(msg);
   log(`DM from ${target}: ${text}`);
@@ -255,6 +260,7 @@ async function main() {
   }
   STATUS.nametag = sphere.identity?.nametag || CONFIG.nametag;
   STATUS.address = sphere.identity?.directAddress || null;
+  STATUS.pubkey = sphere.identity?.publicKey || sphere.identity?.pubkey || null;
 
   await ensureTreasury(sphere);
   await advertiseToMarket(sphere);
