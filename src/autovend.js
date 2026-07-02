@@ -15,6 +15,7 @@ import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 const CONFIG = {
   network: process.env.NETWORK || 'testnet',
+  mnemonic: (process.env.WALLET_MNEMONIC || '').trim(),
   nametag: (process.env.NAMETAG || 'autovend').toLowerCase(),
   apiKey: process.env.UNICITY_API_KEY || 'sk_ddc3cfcc001e4a28ac3fad7407f99590',
   coinSymbol: (process.env.COIN_SYMBOL || 'UCT').toUpperCase(),
@@ -236,7 +237,13 @@ async function main() {
     network: CONFIG.network, dataDir: CONFIG.dataDir, tokensDir: CONFIG.tokensDir,
     oracle: { apiKey: CONFIG.apiKey },
   });
-  const { sphere, created, generatedMnemonic } = await Sphere.init({ ...providers, network: CONFIG.network, autoGenerate: true });
+  const initOpts = { ...providers, network: CONFIG.network, autoGenerate: true };
+if (CONFIG.mnemonic) { initOpts.mnemonic = CONFIG.mnemonic; log('Restoring wallet from WALLET_MNEMONIC...'); }
+const { sphere, created, generatedMnemonic } = await Sphere.init(initOpts);
+if (CONFIG.mnemonic && created && typeof sphere.initializeIdentityFromMnemonic === 'function') {
+  try { await sphere.initializeIdentityFromMnemonic(CONFIG.mnemonic); log('Identity restored via initializeIdentityFromMnemonic.'); }
+  catch (e) { log('initializeIdentityFromMnemonic failed (non-fatal):', e.message); }
+}
 
   if (created && generatedMnemonic) {
     log('A NEW WALLET WAS CREATED. Back up this mnemonic:');
